@@ -1,0 +1,358 @@
+clear all
+addpath('./Func')
+%% 调整参数
+% flag_decomp = 'SVD';
+% flag_decomp = 'NMF';
+flag_decomp = 'load_NMF_data';
+
+flag_ICA = 1; %~ 是否使用ICA算法进行独立成分分析，迭代过程
+flag_plotXsXt = 0; %~ 是否绘制源图和源信号
+flag_plotUV = 0; %~ 是否绘制SVD/NMF分解后的信号
+flag_movie = 0; %~ 是否将混合后的TVI图存储成movie
+
+params.skew_stICA = 1; %~ 是否使用带偏度的stICA算法，1表示skew-stICA，0表示stICA(无偏)
+params.MultiDistribution = 1; %~ 带偏度的stICA前提下，1表示1多概率密度分布函数”，0表示“单一概率密度分布函数”
+params.NMF = 1; %~ 多概率密度分布前提下，1表示使用NMF之后的空间分量作为标准拟合得到分布函数的参数，0表示使用最原始的空间分量作为标准拟合得到参数
+params.noise = 10; %~ 概率密度分布函数中峰值对应的横坐标超过params.noise的认为是噪声
+
+params.k = 5; %~ 潜在源的数目/主成分的个数
+params.alpha = 0.6; %~ 时空ICA的权重参数,alpha=1时表示空间ICA，alpha=0时表示时间ICA
+
+%% 数据重排
+%~ 图像重排
+load('./figure/image1.mat')
+image1 = image_data;
+load('./figure/image2.mat')
+image2 = image_data;
+load('./figure/image3.mat')
+image3 = image_data;
+load('./figure/image4.mat')
+image4 = image_data;
+
+%~ 高斯噪声图像
+image_gs = randn(400,128);
+
+image_all(:,:,1) = image1;
+image_all(:,:,2) = image2;
+image_all(:,:,3) = image3;
+image_all(:,:,4) = image4;
+image_all(:,:,5) = image_gs*3;
+
+Xs = reshape(image_all,size(image_all,1)*size(image_all,2),size(image_all,3));
+
+%% 幅值变化信号
+%~ 正弦波1
+x1 = 0:0.01:10-0.01;
+y1 = sin(400*(x1*pi/360));
+%~ 正弦波2
+x2 = 0:0.01:10-0.01;
+y2 = 2*sin(800*(x2*pi/360));
+%~ 锯齿波
+x3 = 0:pi/31:10+pi/31;
+y3 = sawtooth(3*x2);
+% %~ 方波
+% x3 = 0:pi/314:10;
+% y3 = 1.5*square(2*pi*x3,50);
+%~ 三角波
+x4 = 0:pi/314:10;
+y4 = 0.5*sawtooth(2*x4,0.5);
+
+%~ 高斯噪声信号
+y5 = randn(1,1000)*0.2;
+
+%~ 幅值信号重排
+Xt = [y1' y2' y3' y4' y5'];
+
+%% 时空混合
+%~ 混合矩阵
+As = randn(size(Xs,2))*0.2;
+At = randn(size(Xt,2))*0.2;
+
+% save('./TVIData/TVIdata_simulation.mat','TVIdata')
+
+
+
+%% 下面是stICA算法的各部分实现
+global mindat num_linesearches
+num_linesearches = 0; %~ 迭代次数
+
+params.dataSize = [400 128 size(Xt,2)];
+
+Ws0 = eye(params.k)+randn(params.k)*0.9; %~ Ws作为变量初始化
+
+%% 矩阵分解
+if strcmp(flag_decomp,'SVD')
+%     TVIdata = (Xs*As)*(Xt*At)';
+    TVIdata = Xs*Xt';
+    
+    [U,D,V] = svd(TVIdata,0); %~ svd奇异值分解，0表示精简分解，减少计算量
+    Lambda = D(1:params.k, 1:params.k); %~ 缩放矩阵（大写的Lambda）
+    U_hat = U(:,1:params.k)*sqrt(Lambda);%~ 取svd分解后的空间分量U的前k个主成分作为U_hat（降维）。疑问：*sqrt(Lambda)的作用？
+    V_hat = V(:,1:params.k)*sqrt(Lambda);
+elseif strcmp(flag_decomp,'NMF')
+%     TVI_tmp = (Xs*As)*(Xt*At)';
+    TVI_tmp = Xs*Xt';
+    TVI_tmp_max = max(max(TVI_tmp));
+    TVI_tmp_min = min(min(TVI_tmp));
+    TVIdata = (TVI_tmp - TVI_tmp_min)/(TVI_tmp_max - TVI_tmp_min);
+
+    %~ 归一化
+%     TVIdata = normalize(TVI_tmp,'range',[0 2]); %~ 按列，空间分量效果好，时间分量效果差
+%     TVIdata = normalize(TVI_tmp,2,'range',[0 2]);%~ 按行，空间分量效果差，时间分量效果好一些。进行缩放，使其范围在 [0,1] 区间内
+
+    %~ NMF分解
+    [U_hat,V_tmp] = nnmf(TVIdata,params.k);%~ NMF分解
+
+    V_hat = V_tmp';
+    D = eye(params.k);
+elseif strcmp(flag_decomp,'load_NMF_data')
+    load('./Data/simulation/U_hat.mat');
+    load('./Data/simulation/V_hat.mat');
+    load('./Data/simulation/Ws0.mat');
+else
+    disp('选择一种矩阵分解方法');
+end
+
+%% 自适应拟合概率密度分布函数，确定参数p、a、b、u
+if params.MultiDistribution
+    if params.NMF
+        pts = -10:0.05:50;
+        for i=1:size(U_hat,2)
+            zero_count = find(U_hat(:,i)==0);
+            U_temp = U_hat(:,i);
+            U_temp(zero_count) = [];
+            if ~isempty(U_temp)
+                [f_temp(:,i), x_ksdensity(:,i)] = ksdensity(U_temp,pts);  
+                if ~isempty(find(f_temp(:,i) > 1.5))
+                    f(:,i) = normalize(f_temp(:,i),'range');
+                else
+                    f(:,i) = f_temp(:,i);
+                end
+                [f_max(i), idx(i)] = max(f(:,i));
+            else
+                f(:,i) = 0; 
+                x_ksdensity(:,i) = 0;
+                f_max(i) = 0;
+                idx(i) = 1;
+            end
+        end
+        
+        for i = 1:size(U_hat,2)
+            syms b p u
+            %~ 确定参数a
+            a = 15;
+            %~ 求解u
+            u = floor(x_ksdensity(idx(i),i)/3)*3;
+            if u == x_ksdensity(idx(i),i) 
+                u = u-1;%~ 防止u的值和最大值的横坐标相等导致a=0，即无偏概率分布函数；
+            end
+            if x_ksdensity(idx(i),i) < params.noise
+            x_eqn = a/(sqrt(b^2-a^2)) + u == x_ksdensity(idx(i),i);
+            %~ 求解b
+            b_temp = double(solve(x_eqn));
+            b = abs(b_temp(1)); %~ 取其中一个解的正数即可
+            %~ 求解p
+            x_eqn_value = a/(sqrt(b^2-a^2)) + u;%~ 概率密度分布函数的峰值对应的横坐标的值
+            p_eqn = p*exp(a*(x_eqn_value-u) - b*sqrt((x_eqn_value-u).^2+1)) == f_max(i);
+            p = double(solve(p_eqn));
+            else
+                a = 1.5;
+                b = 2.5;
+                u = 0;
+                p = 1;
+            end
+        
+            %~ 参数整合
+            params.p(i) = p;
+            params.a(i) = a;
+            params.b(i) = b;
+            params.u(i) = u;
+        end
+    else
+        Xs_tmp = reshape(image_all(:,:,1:end-1),size(image_all,1)*size(image_all,2),size(image_all,3)-1);
+        Xs_tmp_max = max(max(Xs_tmp));
+        Xs_tmp_min = min(min(Xs_tmp));
+        Xsdata = (Xs_tmp - Xs_tmp_min)/(Xs_tmp_max - Xs_tmp_min);
+        image_sum = reshape(Xsdata,size(image_all,1),size(image_all,2),size(image_all,3)-1);
+        image_sum(:,:,size(image_all,3)) = image_gs*3;
+        Xs_new = reshape(image_sum,size(image_sum,1)*size(image_sum,2),size(image_sum,3));
+        Xs = normalize(Xs_new,'range',[0 2]);
+
+        pts = -10:0.05:50;
+        for i=1:size(Xs,2)
+            zero_count = find(Xs(:,i)==0);
+            U_temp = Xs(:,i);
+            U_temp(zero_count) = [];
+            if ~isempty(U_temp)
+                [f_temp(:,i), x_ksdensity(:,i)] = ksdensity(U_temp,pts);  
+                if ~isempty(find(f_temp(:,i) > 1.5))
+                    f(:,i) = normalize(f_temp(:,i),'range');
+                else
+                    f(:,i) = f_temp(:,i);
+                end
+                [f_max(i), idx(i)] = max(f(:,i));
+            else
+                f(:,i) = 0; 
+                x_ksdensity(:,i) = 0;
+                f_max(i) = 0;
+                idx(i) = 1;
+            end
+        end
+        
+        for i = 1:size(Xs,2)
+            syms b p u
+            %~ 确定参数a
+            a = 15;
+            %~ 求解u
+            u = floor(x_ksdensity(idx(i),i)/3)*3;
+            if u == x_ksdensity(idx(i),i) 
+                u = u-1;%~ 防止u的值和最大值的横坐标相等导致a=0，即无偏概率分布函数；
+            end
+            if x_ksdensity(idx(i),i) < params.noise
+            x_eqn = a/(sqrt(b^2-a^2)) + u == x_ksdensity(idx(i),i);
+            %~ 求解b
+            b_temp = double(solve(x_eqn));
+            b = abs(b_temp(1)); %~ 取其中一个解的正数即可
+            %~ 求解p
+            x_eqn_value = a/(sqrt(b^2-a^2)) + u;%~ 概率密度分布函数的峰值对应的横坐标的值
+            p_eqn = p*exp(a*(x_eqn_value-u) - b*sqrt((x_eqn_value-u).^2+1)) == f_max(i);
+            p = double(solve(p_eqn));
+            else
+                a = 1.5;
+                b = 2.5;
+                u = 0;
+                p = 1;
+            end
+        
+            %~ 参数整合
+            params.p(i) = p;
+            params.a(i) = a;
+            params.b(i) = b;
+            params.u(i) = u;
+        end
+    end
+end
+
+%% ICA算法的共轭梯度下降迭代
+if flag_ICA
+    Ws = Ws0;
+    fun = @(Ws) f_function(Ws,U_hat,V_hat,params);
+
+    %~ 共轭梯度法
+    options = optimset('Display','iter','PlotFcns',@optimplotfval);
+    [Ws,fval,exitflag,output] = fminunc(fun,Ws,options);
+    
+    %~ 粒子群优化算法
+%     options = optimoptions('particleswarm','ObjectiveLimit',1e-6);
+%     [Ws,fval] = particleswarm(fun,params.k.^2); %~ 粒子群优化算法，全局
+    
+    Ws = reshape(Ws,params.k,params.k);
+    Wt = inv(Ws');
+    S = U_hat*Ws;
+    T = V_hat*Wt;
+end
+
+%% 绘图分析
+if flag_plotXsXt
+    %~ 绘制源图和源信号
+    Xs_plot = reshape(Xs,400,128,size(image_all,3));
+    figure;
+    for i = 1:params.k
+        subplot(1,5,i)
+        imagesc(Xs_plot(:,:,i));
+    end
+    sgtitle('源空间分量')
+    
+    Xt_plot = Xt;
+    figure
+    plot(Xt_plot(:,1),'b','linewidth',2);
+    hold on
+    plot(Xt_plot(:,2),'k','linewidth',2);
+    hold on
+    plot(Xt_plot(:,3),'g','linewidth',2);
+    hold on
+    plot(Xt_plot(:,4),'r','linewidth',2);
+    if params.k == 5
+        hold on
+        plot(Xt_plot(:,5),'y','linewidth',1);
+    end
+    sgtitle('源时间分量')
+    legend('正弦波1','正弦波2','锯齿波','三角波','高斯噪声')
+end
+
+if flag_plotUV
+    %~ 绘制SVD/NMF分解后的信号
+    Xs_plot = reshape(U_hat,400,128,params.k);
+    figure;
+    for i = 1:params.k
+        subplot(1,5,i)
+        imagesc(Xs_plot(:,:,i));
+    end
+    sgtitle('分解后的空间分量')
+
+    Xt_plot = V_hat;
+    figure
+    plot(Xt_plot(:,1),'b','linewidth',2);
+    hold on
+    plot(Xt_plot(:,2),'k','linewidth',2);
+    hold on
+    plot(Xt_plot(:,3),'g','linewidth',2);
+    hold on
+    plot(Xt_plot(:,4),'r','linewidth',2);
+    if params.k == 5
+        hold on
+        plot(Xt_plot(:,5),'y','linewidth',1);
+    end
+    sgtitle('分解后的时间分量')
+    legend('正弦波1','正弦波2','锯齿波','三角波','高斯噪声')
+end
+
+if flag_ICA
+    figure;
+    for i=1:params.k
+        subplot(params.k,2,2*(i-1)+1)
+        imagesc(reshape(S(:,i),[params.dataSize(1) params.dataSize(2)]));
+        title(['Space #' num2str(i)]);
+        subplot(params.k,2,2*(i-1)+2)
+        plot(-1*T(:,i));
+        title(['Temporal #' num2str(i)]);
+    end
+    set(gcf,'unit','normalized','position',[0.3,0.1,0.2,0.8]);
+end
+
+
+%% 混叠后的TVIdata绘图
+if flag_movie
+    TVIData = reshape(TVIdata,400,128,1000);
+    
+    mkdir(['./Movie/' date]);%~ 创建视频保存文件夹
+    Movie_file = dir(fullfile(['./Movie/' date],'*.mp4'));
+    if isempty(Movie_file)
+        MoviePath = ['./Movie/' date '/TVI_Movie_1.mp4']; %~ 视频文件的名称
+    else
+        MoviePath = ['./Movie/' date '/TVI_Movie_' num2str(size(Movie_file,1)+1) '.mp4'];
+    end
+    
+    profile = 'MPEG-4'; %~ 视频文件格式
+    writerObj = VideoWriter(MoviePath,profile); %~ 创建视频文件
+    open(writerObj); %~ 打开该视频文件
+    
+    
+    tic
+    figure;
+    for n = 1:size(TVIData,3)
+        TVI_img = TVIData(:,:,n);
+        TVI_img(isnan(TVI_img)) = 0;
+        imagesc(TVI_img)
+        colorbar
+        caxis([-1 1]*max(max(max(TVIData))));
+        title('Tissue Velocity map')
+        ylabel('[cm]')
+        axis equal ij tight
+        set(gca,'XColor','none','box','off')
+        frame = getframe; %~ 获取图像帧
+        writeVideo(writerObj,frame); %~ 将帧写入视频文件中
+    end
+    toc
+    close(writerObj); %~ 关闭视频文件句柄
+end
